@@ -403,9 +403,9 @@ extension Core {
         }
 
         private func shouldVisit(url: URL) -> Bool {
-            // Check if URL starts with allowed prefixes
-            let urlString = url.absoluteString
-            guard configuration.allowedPrefixes.contains(where: { urlString.hasPrefix($0) }) else {
+            // Check if URL starts with allowed prefixes (case-insensitive)
+            let urlString = url.absoluteString.lowercased()
+            guard configuration.allowedPrefixes.contains(where: { urlString.hasPrefix($0.lowercased()) }) else {
                 return false
             }
 
