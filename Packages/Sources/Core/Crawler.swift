@@ -53,37 +53,60 @@ extension Core {
         public func crawl(onProgress: (@Sendable (CrawlProgress) -> Void)? = nil) async throws -> CrawlStatistics {
             self.onProgress = onProgress
 
-            // Check for resumable session
-            let hasActiveSession = await state.hasActiveSession()
-            if hasActiveSession {
+            // Check for resumable session (must match current start URL)
+            let savedSession = await state.getSavedSession()
+            let canResume = savedSession != nil
+                && savedSession!.isActive
+                && savedSession!.startURL == configuration.startURL.absoluteString
+            if canResume, let savedSession {
                 logInfo("🔄 Found resumable session!")
-                if let savedSession = await state.getSavedSession() {
-                    logInfo("   Resuming from \(savedSession.visited.count) visited URLs")
-                    logInfo("   Queue has \(savedSession.queue.count) pending URLs")
+                logInfo("   Resuming from \(savedSession.visited.count) visited URLs")
+                logInfo("   Queue has \(savedSession.queue.count) pending URLs")
 
-                    // Restore state
-                    visited = savedSession.visited
-                    queue = savedSession.queue.compactMap { queued in
-                        guard let url = URL(string: queued.url) else { return nil }
-                        return (url: url, depth: queued.depth)
-                    }
+                // Restore state
+                visited = savedSession.visited
+                queue = savedSession.queue.compactMap { queued in
+                    guard let url = URL(string: queued.url) else { return nil }
+                    return (url: url, depth: queued.depth)
+                }
 
-                    // Restore or initialize stats
-                    await state.updateStatistics { stats in
-                        if stats.startTime == nil {
-                            stats.startTime = savedSession.sessionStartTime
-                        }
+                // Restore or initialize stats
+                await state.updateStatistics { stats in
+                    if stats.startTime == nil {
+                        stats.startTime = savedSession.sessionStartTime
                     }
                 }
             } else {
+                // Clear stale session if start URL doesn't match
+                if savedSession != nil {
+                    logInfo("⚠️ Ignoring saved session (different start URL)")
+                    await state.clearSessionState()
+                }
                 // Initialize stats for new crawl
                 let startTime = Date()
                 await state.updateStatistics { stats in
                     stats = CrawlStatistics(startTime: startTime)
                 }
 
-                // Initialize queue
-                queue = [(url: configuration.startURL, depth: 0)]
+                // Initialize queue — seed from technologies.json for Apple docs root
+                let isAppleDocs = configuration.startURL.host?.contains("developer.apple.com") == true
+                let isDocsRoot = configuration.startURL.path == "/documentation"
+                    || configuration.startURL.path == "/documentation/"
+
+                if isAppleDocs && isDocsRoot {
+                    do {
+                        logInfo("📋 Fetching technology index for complete framework coverage...")
+                        let frameworkURLs = try await TechnologiesIndexFetcher.fetchFrameworkURLs()
+                        queue = frameworkURLs.map { (url: $0, depth: 0) }
+                        logInfo("   ✅ Seeded queue with \(frameworkURLs.count) framework root URLs")
+                    } catch {
+                        logInfo("   ⚠️ Failed to fetch technology index: \(error.localizedDescription)")
+                        logInfo("   ⚠️ Falling back to start URL only")
+                        queue = [(url: configuration.startURL, depth: 0)]
+                    }
+                } else {
+                    queue = [(url: configuration.startURL, depth: 0)]
+                }
 
                 logInfo("🚀 Starting new crawl")
             }
@@ -254,6 +277,14 @@ extension Core {
                 filePath: jsonFilePath
             )
 
+            // Enqueue discovered links before any early returns
+            // so child pages are always discovered even when content is unchanged
+            if depth < configuration.maxDepth {
+                for link in links where shouldVisit(url: link) {
+                    queue.append((url: link, depth: depth + 1))
+                }
+            }
+
             if !shouldRecrawl {
                 logInfo("   ⏩ No changes detected, skipping")
                 await state.updateStatistics { $0.skippedPages += 1 }
@@ -297,13 +328,6 @@ extension Core {
             }
 
             await state.updateStatistics { $0.totalPages += 1 }
-
-            // Enqueue discovered links
-            if depth < configuration.maxDepth {
-                for link in links where shouldVisit(url: link) {
-                    queue.append((url: link, depth: depth + 1))
-                }
-            }
 
             // Notify progress
             if let onProgress {
@@ -380,9 +404,9 @@ extension Core {
         }
 
         private func shouldVisit(url: URL) -> Bool {
-            // Check if URL starts with allowed prefixes
-            let urlString = url.absoluteString
-            guard configuration.allowedPrefixes.contains(where: { urlString.hasPrefix($0) }) else {
+            // Check if URL starts with allowed prefixes (case-insensitive)
+            let urlString = url.absoluteString.lowercased()
+            guard configuration.allowedPrefixes.contains(where: { urlString.hasPrefix($0.lowercased()) }) else {
                 return false
             }
 
